@@ -1,58 +1,50 @@
 import { NextAuthOptions } from 'next-auth';
-import GoogleProvider from 'next-auth/providers/google';
+import CredentialsProvider from 'next-auth/providers/credentials';
 import dbConnect from './mongodb';
 import User from '../models/User';
+import { encryptPassword } from './crypto';
+import { verifyImapCredentials } from './imap';
 
 export const authOptions: NextAuthOptions = {
   providers: [
-    GoogleProvider({
-      clientId: process.env.GOOGLE_CLIENT_ID as string,
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET as string,
-      authorization: {
-        params: {
-          prompt: 'consent',
-          access_type: 'offline',
-          response_type: 'code',
-          scope: 'openid email profile https://www.googleapis.com/auth/gmail.readonly',
-        },
+    CredentialsProvider({
+      name: 'Gmail & App Password',
+      credentials: {
+        email: { label: "Gmail Address", type: "email", placeholder: "you@gmail.com" },
+        appPassword: { label: "App Password", type: "password", placeholder: "16-character app password" }
       },
-    }),
+      async authorize(credentials) {
+        if (!credentials?.email || !credentials?.appPassword) {
+          throw new Error('Email and App Password are required');
+        }
+
+        const isValid = await verifyImapCredentials(credentials.email, credentials.appPassword);
+        
+        if (!isValid) {
+           throw new Error('Invalid IMAP credentials. Ensure you are using an App Password and IMAP is enabled.');
+        }
+
+        await dbConnect();
+        
+        const encrypted = encryptPassword(credentials.appPassword);
+        
+        let user = await User.findOne({ email: credentials.email.toLowerCase() });
+        if (user) {
+          user.app_password = encrypted;
+          await user.save();
+        } else {
+          user = await User.create({
+            email: credentials.email.toLowerCase(),
+            app_password: encrypted
+          });
+        }
+
+        return { id: user._id.toString(), email: user.email };
+      }
+    })
   ],
   callbacks: {
-    async signIn({ user, account }) {
-      if (account?.provider === 'google') {
-        try {
-          await dbConnect();
-
-          const existingUser = await User.findOne({ google_id: user.id });
-
-          if (existingUser) {
-            // Update tokens
-            existingUser.access_token = account.access_token;
-            if (account.refresh_token) {
-              existingUser.refresh_token = account.refresh_token;
-            }
-            await existingUser.save();
-          } else {
-            // Create new user
-            await User.create({
-              google_id: user.id,
-              email: user.email,
-              name: user.name,
-              access_token: account.access_token,
-              refresh_token: account.refresh_token,
-            });
-          }
-          return true;
-        } catch (error) {
-          console.error('Error saving user during sign in:', error);
-          return false;
-        }
-      }
-      return false;
-    },
     async session({ session, token }) {
-      // Attach the user ID to the session
       if (session?.user && token.sub) {
         (session.user as any).id = token.sub;
       }
@@ -63,7 +55,7 @@ export const authOptions: NextAuthOptions = {
         token.sub = user.id;
       }
       return token;
-    },
+    }
   },
   session: {
     strategy: 'jwt',
